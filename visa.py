@@ -62,6 +62,8 @@ HUB_ADDRESS = config['CHROMEDRIVER']['HUB_ADDRESS']
 BASE_URL = "https://ais.usvisa-info.com"  # Default, can be overridden
 SIGN_IN_LINK = f"{BASE_URL}/{EMBASSY}/niv/users/sign_in"
 APPOINTMENT_URL = f"{BASE_URL}/{EMBASSY}/niv/schedule/{SCHEDULE_ID}/appointment"
+
+# https://ais.usvisa-info.com/en-am/niv/schedule/64393248/appointment/days/122.json?appointments[expedite]=false
 DATE_URL = f"{BASE_URL}/{EMBASSY}/niv/schedule/{SCHEDULE_ID}/appointment/days/{FACILITY_ID}.json?appointments[expedite]=false"
 TIME_URL = f"{BASE_URL}/{EMBASSY}/niv/schedule/{SCHEDULE_ID}/appointment/times/{FACILITY_ID}.json?date=%s&appointments[expedite]=false"
 SIGN_OUT_LINK = f"{BASE_URL}/{EMBASSY}/niv/users/sign_out"
@@ -123,65 +125,196 @@ def start_process():
 
 def reschedule(date):
     driver.get(APPOINTMENT_URL)
-    Wait(driver, 10).until(EC.presence_of_element_located((By.NAME, "appointments[consulate_appointment][date]")))
-    auto_action("Select Date", "name", "appointments[consulate_appointment][date]", "send", date, STEP_TIME)
-    time.sleep(1)
-    time = get_time(date)
-    auto_action("Select Time", "name", "appointments[consulate_appointment][time]", "send", time, STEP_TIME)
-    auto_action("Submit", "name", "commit", "click", "", STEP_TIME)
+    
+    # Wait for the calendar to load
+    try:
+        Wait(driver, 10).until(EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'calendar')]")))
+    except TimeoutException:
+        return ["FAIL", f"Failed to load calendar for {date}"]
+    
+    # Parse the target date to extract the day, month, and year
+    target_date = datetime.strptime(date, "%Y-%m-%d")
+    target_day = target_date.day
+    target_month = target_date.strftime("%B")  # e.g., "March" or "April"
+    target_year = target_date.year  # e.g., 2025
+    
+    # Ensure the correct month is displayed in the calendar
+    try:
+        current_month = driver.find_element(By.XPATH, "//div[contains(@class, 'month-header')]").text  # Adjust XPath as needed
+        while target_month not in current_month or str(target_year) not in current_month:
+            # Click the "next month" button until the target month is displayed
+            if not auto_action("Next Month", "xpath", "//button[contains(@class, 'next-month')]", "click", "", STEP_TIME):
+                return ["FAIL", f"Failed to navigate to {target_month} {target_year}"]
+            current_month = driver.find_element(By.XPATH, "//div[contains(@class, 'month-header')]").text
+    except Exception as e:
+        return ["FAIL", f"Failed to navigate calendar: {str(e)}"]
+    
+    # Select the target day from the calendar
+    day_xpath = f"//td[contains(@class, 'day') and text()='{target_day}' and not(contains(@class, 'disabled'))]"
+    if not auto_action("Select Date", "xpath", day_xpath, "click", "", STEP_TIME):
+        return ["FAIL", f"Failed to select date {date} - Day not available or clickable"]
+    
+    # After selecting the date, the website might load available times
+    # Wait for the time selection element to appear (e.g., a dropdown)
+    try:
+        Wait(driver, 10).until(EC.presence_of_element_located((By.NAME, "appointments[consulate_appointment][time]")))
+        # Fetch the time using the existing get_time function (if the API still works)
+        time = get_time(date)
+        if not time:
+            return ["FAIL", f"Failed to fetch time for {date}"]
+        
+        # Select the time from a dropdown (assuming the element still exists)
+        if not auto_action("Select Time", "name", "appointments[consulate_appointment][time]", "send", time, STEP_TIME):
+            return ["FAIL", f"Failed to select time {time} for {date}"]
+    except TimeoutException:
+        # If no time selection is required on this page, proceed to reschedule
+        print("No time selection required on this page, proceeding to reschedule...")
+    
+    # Click the "Reschedule" button to confirm
+    if not auto_action("Reschedule", "xpath", "//button[contains(text(), 'Reschedule')]", "click", "", STEP_TIME):
+        return ["FAIL", f"Failed to click Reschedule button for {date}"]
+    
+    # Wait for confirmation
     Wait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     if "Successfully Scheduled" in driver.page_source:
-        return ["SUCCESS", f"Rescheduled Successfully! {date} {time}"]
-    return ["FAIL", f"Reschedule Failed! {date} {time}"]
+        return ["SUCCESS", f"Rescheduled Successfully! {date} {time if 'time' in locals() else 'N/A'}"]
+    return ["FAIL", f"Reschedule Failed! {date} {time if 'time' in locals() else 'N/A'}"]
 
 def get_date():
     try:
-        print(f"Attempting to get dates from: {DATE_URL}")
-        # Use requests with session cookies from Selenium for better reliability
-        cookies = driver.get_cookies()
+        driver.get(APPOINTMENT_URL)
+        Wait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        
+        # Extract CSRF token exactly as shown in the working request
+        csrf_token = driver.execute_script("""
+            return document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+        """)
+        
+        cookies_dict = {cookie['name']: cookie['value'] for cookie in driver.get_cookies()}
         session = requests.Session()
-        for cookie in cookies:
+        
+
+        headers = {
+            'accept': 'application/json, text/javascript, */*; q=0.01',
+            'accept-encoding': 'gzip, deflate, br, zstd',
+            'accept-language': 'en-AU,en-GB;q=0.9,en-US;q=0.8,en;q=0.7,fa;q=0.6',
+            'cache-control': 'no-cache',
+            'connection': 'keep-alive',
+            'pragma': 'no-cache',
+            'referer': APPOINTMENT_URL,
+            'sec-ch-ua': '"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"',
+            'sec-ch-ua-mobile': '?1',
+            'sec-ch-ua-platform': '"Android"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'user-agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36',
+            'x-csrf-token': csrf_token,
+            'x-requested-with': 'XMLHttpRequest',
+            'host': 'ais.usvisa-info.com'
+        }
+        
+        # Copy all cookies from the driver
+        for cookie in driver.get_cookies():
             session.cookies.set(cookie['name'], cookie['value'])
-        response = session.get(DATE_URL, timeout=10)
+        
+        response = session.get(DATE_URL, headers=headers, timeout=15)
+        
+        if response.status_code == 403:
+            return None
+            
         response.raise_for_status()
         content = response.text
-        print(f"Date content received: {content[:100]}...")
+        
+        # Log the date content response
+        msg = f"Date Response Content:\n{content}"
+        print(msg)
+        info_logger(LOG_FILE_NAME, msg)
+        
         return json.loads(content)
-    except requests.exceptions.RequestException as e:
-        msg = f"Network error getting dates: {str(e)}"
-        print(msg)
-        info_logger(LOG_FILE_NAME, msg)
-        time.sleep(30)
-        return None
-    except json.JSONDecodeError as e:
-        msg = f"JSON parsing error: {str(e)}, Content: {content[:200]}"
-        print(msg)
-        info_logger(LOG_FILE_NAME, msg)
-        return None
     except Exception as e:
-        msg = f"Failed to get dates: {str(e)}"
-        print(msg)
-        info_logger(LOG_FILE_NAME, msg)
-        try:
-            screenshot_path = f"error_screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            driver.save_screenshot(screenshot_path)
-            print(f"Screenshot saved to {screenshot_path}")
-        except:
-            print("Failed to save screenshot")
+        print(f"Error in get_date: {str(e)}")
         return None
 
 def get_time(date):
     try:
         url = TIME_URL % date
-        cookies = driver.get_cookies()
+        
+        # First, visit the appointment page to get the proper CSRF token
+        driver.get(APPOINTMENT_URL)
+        Wait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        
+        # Extract CSRF token exactly as shown in the working request
+        csrf_token = None
+        try:
+            # Try to extract token from JavaScript directly
+            csrf_token = driver.execute_script("""
+                return document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+            """)
+            print(f"Found CSRF token via JS: {csrf_token}")
+        except Exception as e:
+            print(f"Error getting CSRF token via JS: {str(e)}")
+            
+        # Fallback method - look for the token in the page source
+        if not csrf_token:
+            try:
+                # Look for the token in HTML
+                page_source = driver.page_source
+                import re
+                token_match = re.search(r'<meta name="csrf-token" content="([^"]+)"', page_source)
+                if token_match:
+                    csrf_token = token_match.group(1)
+                    print(f"Found CSRF token via regex: {csrf_token}")
+            except Exception as e:
+                print(f"Error getting CSRF token via regex: {str(e)}")
+        
+        # Create a session and set cookies
         session = requests.Session()
-        for cookie in cookies:
+        for cookie in driver.get_cookies():
             session.cookies.set(cookie['name'], cookie['value'])
-        response = session.get(url, timeout=10)
+        
+        # Set exact headers as in the working request
+        headers = {
+            'accept': 'application/json, text/javascript, */*; q=0.01',
+            'accept-encoding': 'gzip, deflate, br, zstd',
+            'accept-language': 'en-AU,en-GB;q=0.9,en-US;q=0.8,en;q=0.7,fa;q=0.6',
+            'cache-control': 'no-cache',
+            'connection': 'keep-alive',
+            'pragma': 'no-cache',
+            'referer': APPOINTMENT_URL,
+            'sec-ch-ua': '"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"',
+            'sec-ch-ua-mobile': '?1',
+            'sec-ch-ua-platform': '"Android"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'user-agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36',
+            'x-csrf-token': csrf_token,
+            'x-requested-with': 'XMLHttpRequest',
+            'host': 'ais.usvisa-info.com'
+        }
+        
+        # Make request
+        print(f"Making time request to {url}")
+        response = session.get(url, headers=headers, timeout=15)
+        
+        # Check response
+        print(f"Time response status code: {response.status_code}")
+        if response.status_code == 403:
+            msg = f"Forbidden error (403) when getting time for date {date}."
+            print(msg)
+            info_logger(LOG_FILE_NAME, msg)
+            return None
+            
         response.raise_for_status()
         content = response.text
         data = json.loads(content)
-        time = data.get("available_times")[-1]
+        time_slots = data.get("available_times", [])
+        if not time_slots:
+            print(f"No available times for date {date}")
+            return None
+            
+        time = time_slots[-1] 
         print(f"Got time successfully! {date} {time}")
         return time
     except Exception as e:
@@ -218,7 +351,7 @@ def info_logger(file_path, log):
     with open(file_path, "a") as file:
         file.write(f"{datetime.now().time()}:\n{log}\n")
 
-def get_date_with_retry(max_retries=3, initial_wait=5):
+def get_date_with_retry(max_retries=1, initial_wait=5):
     for attempt in range(1, max_retries + 1):
         print(f"Date fetch attempt {attempt}/{max_retries}")
         result = get_date()
@@ -287,7 +420,7 @@ if __name__ == "__main__":
             continue
 
         try:
-            dates = get_date_with_retry(max_retries=3, initial_wait=5)
+            dates = get_date_with_retry(max_retries=1, initial_wait=5)
             if not dates:
                 msg = f"Empty date list or error after retries, possibly banned! Sleeping for {BAN_COOLDOWN_TIME} hours."
                 print(msg)
